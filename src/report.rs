@@ -16,6 +16,7 @@ pub struct SystemLabel {
     pub skip: bool,
 }
 
+#[derive(Clone)]
 pub struct Options {
     pub prefix: String,
     /// Retain each system's state (the per-call events never are).
@@ -29,6 +30,8 @@ pub struct Options {
 
 pub struct Reporter {
     opt: Options,
+    /// Retained messages that empty discovery topics no longer wanted.
+    cleanup: Vec<Message>,
     systems: Vec<SystemLabel>,
     counts: HashMap<String, Counts>,
     out: Box<dyn Publisher>,
@@ -36,17 +39,25 @@ pub struct Reporter {
 
 impl Reporter {
     pub fn new(opt: Options, systems: Vec<SystemLabel>, out: Box<dyn Publisher>) -> Reporter {
-        Reporter { opt, systems, counts: HashMap::new(), out }
+        Reporter { opt, cleanup: Vec::new(), systems, counts: HashMap::new(), out }
     }
 
-    /// Sent at every (re)connect: that the recorder is online, and Home Assistant's discovery.
+    /// Home Assistant's discovery messages for the systems kept (none when it's off).
+    pub fn discovery(&self) -> Vec<Message> {
+        let Some(d) = &self.opt.discovery else { return Vec::new() };
+        self.systems.iter().filter(|s| !s.skip).flat_map(|s| messages::discovery(&self.opt.prefix, d, &self.opt.node, &s.label, &s.label)).collect()
+    }
+
+    /// Discovery topics an earlier run published that this one doesn't: say they're gone.
+    pub fn clean_up(&mut self, previous: &[String]) {
+        self.cleanup = stale_discovery(previous, &self.discovery());
+    }
+
+    /// Sent at every (re)connect: that the recorder is online, Home Assistant's discovery, and what to clear from it.
     pub fn on_connect(&self) -> Vec<Message> {
         let mut m = vec![Message { topic: messages::status_topic(&self.opt.prefix), payload: "online".into(), retain: true }];
-        if let Some(d) = &self.opt.discovery {
-            for s in self.systems.iter().filter(|s| !s.skip) {
-                m.extend(messages::discovery(&self.opt.prefix, d, &self.opt.node, &s.label, &s.label));
-            }
-        }
+        m.extend(self.discovery());
+        m.extend(self.cleanup.iter().cloned());
         m
     }
 
@@ -83,6 +94,11 @@ impl Reporter {
             self.out.publish(Message { topic: messages::call_topic(&self.opt.prefix, &label), payload, retain: false });
         }
     }
+}
+
+/// Messages that empty (retained) the topics in `previous` that `current` no longer has.
+pub fn stale_discovery(previous: &[String], current: &[Message]) -> Vec<Message> {
+    previous.iter().filter(|t| !current.iter().any(|m| &m.topic == *t)).map(|t| Message { topic: t.clone(), payload: String::new(), retain: true }).collect()
 }
 
 #[cfg(test)]
@@ -176,5 +192,28 @@ mod tests {
         let (r, _) = reporter(true, true);
         let m = r.on_connect();
         assert!(m.len() > 1 && m.iter().skip(1).all(|m| m.topic.starts_with("homeassistant/") && m.topic.contains("rec_County")), "{m:?}");
+    }
+
+    #[test]
+    fn discovery_no_longer_wanted_is_emptied() {
+        let (mut r, _) = reporter(true, true);
+        let now: Vec<String> = r.discovery().into_iter().map(|m| m.topic).collect();
+        assert!(!now.is_empty());
+        // Nothing changed: nothing to clear.
+        r.clean_up(&now);
+        assert_eq!(r.on_connect().len(), 1 + now.len());
+        // A topic an earlier run had, and one this run has.
+        let mut before = now.clone();
+        before.push("homeassistant/sensor/rec_Old/decode_rate/config".into());
+        r.clean_up(&before);
+        let m = r.on_connect();
+        assert_eq!(m.len(), 2 + now.len());
+        assert_eq!(m.last().unwrap(), &Message { topic: "homeassistant/sensor/rec_Old/decode_rate/config".into(), payload: String::new(), retain: true });
+        // Discovery turned off: all of it is cleared.
+        let (mut off, _) = reporter(true, false);
+        off.clean_up(&now);
+        let m = off.on_connect();
+        assert_eq!(m.len(), 1 + now.len());
+        assert!(m.iter().skip(1).all(|m| m.payload.is_empty() && m.retain));
     }
 }

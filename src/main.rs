@@ -117,6 +117,12 @@ fn check(c: &Config) -> Result<(), String> {
     if c.host.trim().is_empty() {
         return Err("Broker host is empty".into());
     }
+    if c.port == 0 {
+        return Err("Port must be 1 to 65535".into());
+    }
+    if c.qos > 1 {
+        return Err(format!("Quality of service must be 0 or 1, not {}", c.qos));
+    }
     if c.client_id.trim().is_empty() {
         return Err("Client ID is empty".into());
     }
@@ -126,6 +132,19 @@ fn check(c: &Config) -> Result<(), String> {
     }
     if c.home_assistant && (c.discovery_prefix.trim().is_empty() || c.discovery_prefix.contains(['+', '#', '\0'])) {
         return Err("Discovery prefix must be a topic like homeassistant".into());
+    }
+    Ok(())
+}
+
+/// Systems that would share a topic (`County Fire` and `County/Fire` are both `County_Fire`) overwrite each other.
+fn unique_levels(systems: &[SystemLabel]) -> Result<(), String> {
+    let mut seen: Vec<(String, &str)> = Vec::new();
+    for s in systems.iter().filter(|s| !s.skip) {
+        let l = messages::level(&s.label);
+        if let Some((_, other)) = seen.iter().find(|(x, _)| *x == l) {
+            return Err(format!("Systems {other} and {} would both publish to topic level {l}: give one a different Name", s.short_name));
+        }
+        seen.push((l, &s.short_name));
     }
     Ok(())
 }
@@ -155,6 +174,7 @@ impl Plugin for Mqtt {
                 SystemLabel { short_name: s.short_name.clone(), label, skip: sc.is_some_and(|c| c.skip) }
             })
             .collect();
+        unique_levels(&systems)?;
         let opt = Options {
             prefix: c.topic_prefix.clone(),
             retain: c.retain,
@@ -162,6 +182,7 @@ impl Plugin for Mqtt {
             discovery: c.home_assistant.then(|| c.discovery_prefix.clone()),
             node: c.client_id.clone(),
         };
+        // (`check` has seen that it's 0 or 1.)
         let qos = if c.qos == 0 { QoS::AtMostOnce } else { QoS::AtLeastOnce };
         let will = (messages::status_topic(&c.topic_prefix), "offline".to_string());
         let settings = link::Settings {
@@ -175,18 +196,12 @@ impl Plugin for Mqtt {
             will,
         };
         // The link and the reporter are made together: the link replays what the reporter says at every connect.
-        let on_connect = Reporter::new(
-            Options {
-                prefix: opt.prefix.clone(),
-                retain: opt.retain,
-                publish_calls: opt.publish_calls,
-                discovery: opt.discovery.clone(),
-                node: opt.node.clone(),
-            },
-            systems.clone(),
-            Box::new(NoPublish),
-        )
-        .on_connect();
+        let mut first = Reporter::new(opt.clone(), systems.clone(), Box::new(NoPublish));
+        // Home Assistant keeps what was published until it's emptied: clear what an earlier run published that this one doesn't.
+        let seen = setup.data_dir.join(DISCOVERY_FILE);
+        first.clean_up(&read_topics(&seen));
+        write_topics(&seen, &first.discovery().into_iter().map(|m| m.topic).collect::<Vec<_>>(), &host);
+        let on_connect = first.on_connect();
         let link = Link::start(settings, on_connect, host.clone());
         let prefix = c.topic_prefix.clone();
         host.info(format!("publishing under {prefix}/ to {}:{}", c.host, c.port));
@@ -215,6 +230,19 @@ impl Plugin for Mqtt {
     fn shutdown(&mut self, grace: Duration) {
         let last = Message { topic: messages::status_topic(&self.prefix), payload: "offline".into(), retain: true };
         self.link.close(last, grace.min(Duration::from_secs(3)));
+    }
+}
+
+/// The discovery topics the last run published, kept in the plugin's data folder.
+const DISCOVERY_FILE: &str = "discovery-topics.json";
+
+fn read_topics(path: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+fn write_topics(path: &std::path::Path, topics: &[String], host: &Host) {
+    if let Err(e) = std::fs::write(path, serde_json::to_string(topics).unwrap_or_default()) {
+        host.warn(format!("can't write {}: {e}", path.display()));
     }
 }
 
@@ -248,6 +276,34 @@ mod tests {
             assert!(check(&bad).is_err());
         }
         assert!(check(&Config { topic_prefix: "radio/trunk".into(), ..Default::default() }).is_ok(), "a prefix may have levels");
+    }
+
+    #[test]
+    fn discovery_topics_are_remembered_between_runs() {
+        let dir = trunk_recorder_plugin::testing::temp_dir("mqtt-topics");
+        let f = dir.join(DISCOVERY_FILE);
+        assert!(read_topics(&f).is_empty(), "none yet");
+        let host = trunk_recorder_plugin::testing::capture().0;
+        write_topics(&f, &["a/b/config".to_string()], &host);
+        assert_eq!(read_topics(&f), ["a/b/config"]);
+        std::fs::write(&f, "not json").unwrap();
+        assert!(read_topics(&f).is_empty(), "a damaged file is no memory");
+    }
+
+    #[test]
+    fn qos_and_port_must_be_valid() {
+        assert!(check(&Config { qos: 1, ..Default::default() }).is_ok());
+        assert!(check(&Config { qos: 2, ..Default::default() }).is_err());
+        assert!(check(&Config { port: 0, ..Default::default() }).is_err());
+    }
+
+    #[test]
+    fn systems_cannot_share_a_topic() {
+        let sys = |n: &str, l: &str, skip| SystemLabel { short_name: n.into(), label: l.into(), skip };
+        assert!(unique_levels(&[sys("a", "County Fire", false), sys("b", "City", false)]).is_ok());
+        let e = unique_levels(&[sys("a", "County Fire", false), sys("b", "County/Fire", false)]).unwrap_err();
+        assert!(e.contains("a and b"), "{e}");
+        assert!(unique_levels(&[sys("a", "X", false), sys("b", "X", true)]).is_ok(), "a system left out takes no topic");
     }
 
     #[test]

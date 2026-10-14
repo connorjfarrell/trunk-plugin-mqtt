@@ -68,10 +68,12 @@ impl Link {
         for m in &on_connect {
             link.publish(m.clone());
         }
-        let (done, qos, where_, sent, acked, closing) =
-            (link.done.clone(), s.qos, format!("{}:{}", s.host, s.port), link.sent.clone(), link.acked.clone(), link.closing.clone());
+        let (done, where_, sent, acked, closing, me) =
+            (link.done.clone(), format!("{}:{}", s.host, s.port), link.sent.clone(), link.acked.clone(), link.closing.clone(), link.clone());
         let _ = std::thread::Builder::new().name("mqtt".into()).spawn(move || {
             let (mut up, mut connects) = (false, 0);
+            // What a reconnect has to say again, until the queue has taken all of it.
+            let mut replay: Vec<Message> = Vec::new();
             for ev in conn.iter() {
                 match ev {
                     Ok(Event::Incoming(Packet::ConnAck(_))) => {
@@ -81,9 +83,7 @@ impl Link {
                         // The first connect has them already (queued at the start); a later one sends them again.
                         connects += 1;
                         if connects > 1 && !closing.load(Ordering::SeqCst) {
-                            for m in &on_connect {
-                                let _ = client.try_publish(&m.topic, qos, m.retain, m.payload.clone());
-                            }
+                            replay = on_connect.clone();
                         }
                     }
                     Ok(Event::Outgoing(rumqttc::Outgoing::Disconnect)) => break,
@@ -104,6 +104,9 @@ impl Link {
                         std::thread::sleep(Duration::from_secs(5));
                     }
                 }
+                if !closing.load(Ordering::SeqCst) {
+                    replay.retain(|m| !me.try_publish(m));
+                }
             }
             done.store(true, Ordering::SeqCst);
         });
@@ -115,11 +118,26 @@ impl Link {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    /// Say `last` (retained), disconnect cleanly, and wait up to `grace` for it to be sent.
+    /// Whether the queue took `m` (counted for [`Link::close`]).
+    fn try_publish(&self, m: &Message) -> bool {
+        let ok = self.client.try_publish(&m.topic, self.qos, m.retain, m.payload.clone()).is_ok();
+        if ok {
+            self.queued.fetch_add(1, Ordering::SeqCst);
+        }
+        ok
+    }
+
+    /// Say `last` (retained), disconnect cleanly, and wait up to `grace` for it to be sent. If `last` can't
+    /// be queued in that time, don't disconnect cleanly: the broker then sends the will, which says the same.
     pub fn close(&self, last: Message, grace: Duration) {
         let t = Instant::now();
         self.closing.store(true, Ordering::SeqCst);
-        self.publish(last);
+        while !self.try_publish(&last) {
+            if t.elapsed() >= grace {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         // A disconnect right behind queued messages can lose them: let them go first.
         let settled = |s: &Link| {
             let (queued, got) =
@@ -139,10 +157,8 @@ impl Link {
 
 impl Publisher for Link {
     fn publish(&self, m: Message) {
-        if self.client.try_publish(&m.topic, self.qos, m.retain, m.payload).is_err() {
+        if !self.try_publish(&m) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.queued.fetch_add(1, Ordering::SeqCst);
         }
     }
 }

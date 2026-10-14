@@ -200,9 +200,11 @@ impl Plugin for Mqtt {
         // Home Assistant keeps what was published until it's emptied: clear what an earlier run published that this one doesn't.
         let seen = setup.data_dir.join(DISCOVERY_FILE);
         first.clean_up(&read_topics(&seen));
-        write_topics(&seen, &first.discovery().into_iter().map(|m| m.topic).collect::<Vec<_>>(), &host);
+        let now: Vec<String> = first.discovery().into_iter().map(|m| m.topic).collect();
+        let (note, write_host) = (seen.clone(), host.clone());
         let on_connect = first.on_connect();
-        let link = Link::start(settings, on_connect, host.clone());
+        // The set is remembered once the broker has been told it (if it never is, the next run clears what this one would have).
+        let link = Link::start(settings, on_connect, host.clone(), move || write_topics(&note, &now, &write_host));
         let prefix = c.topic_prefix.clone();
         host.info(format!("publishing under {prefix}/ to {}:{}", c.host, c.port));
         Ok(Mqtt { reporter: Reporter::new(opt, systems, Box::new(link.clone())), link, prefix, host, reported_drops: 0 })

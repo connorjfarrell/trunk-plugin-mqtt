@@ -2,7 +2,7 @@
 //! blocks the plugin.
 //!
 //! While the broker is away nothing piles up without bound: the latest of
-//! each retained message (a system's state) is kept, and a bounded number of
+//! each state message (a system's state) is kept, and a bounded number of
 //! per-call events; both go out when it's back. What's over is dropped and
 //! counted.
 
@@ -37,8 +37,8 @@ pub struct Settings {
 #[derive(Default)]
 struct Held {
     up: bool,
-    /// The latest retained message of each topic.
-    retained: BTreeMap<String, Message>,
+    /// The latest of each topic's states.
+    latest: BTreeMap<String, Message>,
     events: VecDeque<Message>,
 }
 
@@ -160,7 +160,7 @@ impl Link {
         if h.up {
             return;
         }
-        let waiting: Vec<Message> = std::mem::take(&mut h.retained).into_values().chain(std::mem::take(&mut h.events)).collect();
+        let waiting: Vec<Message> = std::mem::take(&mut h.latest).into_values().chain(std::mem::take(&mut h.events)).collect();
         for m in waiting {
             if !self.try_publish(&m) {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -212,7 +212,7 @@ impl Link {
 
     fn held_is_empty(&self) -> bool {
         let h = self.held.lock().unwrap();
-        h.retained.is_empty() && h.events.is_empty()
+        h.latest.is_empty() && h.events.is_empty()
     }
 }
 
@@ -221,8 +221,8 @@ impl Publisher for Link {
         let mut h = self.held.lock().unwrap();
         if !h.up {
             // The broker is away: keep the latest state, and a few events.
-            if m.retain {
-                h.retained.insert(m.topic.clone(), m);
+            if !m.event {
+                h.latest.insert(m.topic.clone(), m);
             } else {
                 if h.events.len() >= EVENTS_HELD {
                     h.events.pop_front();
@@ -261,7 +261,7 @@ mod tests {
     }
 
     fn msg(topic: &str, payload: &str, retain: bool) -> Message {
-        Message { topic: topic.into(), payload: payload.into(), retain }
+        Message { topic: topic.into(), payload: payload.into(), retain, event: !retain }
     }
 
     #[test]
@@ -273,12 +273,30 @@ mod tests {
             l.publish(msg("p/a/call", &format!("{i}"), false));
         }
         let h = l.held.lock().unwrap();
-        assert_eq!(h.retained.len(), 2, "one state per topic");
-        assert_eq!(h.retained["p/a/state"].payload, "999", "the latest");
+        assert_eq!(h.latest.len(), 2, "one state per topic");
+        assert_eq!(h.latest["p/a/state"].payload, "999", "the latest");
         assert_eq!(h.events.len(), EVENTS_HELD);
         assert_eq!(h.events.back().unwrap().payload, "999");
         assert_eq!(h.events.front().unwrap().payload, format!("{}", 1000 - EVENTS_HELD), "the oldest went");
         assert_eq!(l.dropped(), (1000 - EVENTS_HELD) as u64);
+    }
+
+    #[test]
+    fn unretained_state_cannot_crowd_out_call_events() {
+        let (l, _conn) = away();
+        for i in 0..1000 {
+            l.publish(Message { topic: "p/a/state".into(), payload: format!("{i}"), retain: false, event: false });
+        }
+        for i in 0..10 {
+            l.publish(Message { topic: "p/a/call".into(), payload: format!("{i}"), retain: false, event: true });
+        }
+        for i in 0..1000 {
+            l.publish(Message { topic: "p/a/state".into(), payload: format!("{i}"), retain: false, event: false });
+        }
+        let h = l.held.lock().unwrap();
+        assert_eq!(h.events.len(), 10, "every call is still waiting");
+        assert_eq!(h.latest.len(), 1);
+        assert_eq!(l.dropped(), 0);
     }
 
     #[test]

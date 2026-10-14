@@ -12,6 +12,8 @@ pub struct Message {
     pub topic: String,
     pub payload: String,
     pub retain: bool,
+    /// One of a stream (a call), none of which may stand in for another; the rest are states, of which only the latest matters.
+    pub event: bool,
 }
 
 /// Where messages go: the broker link, or a recording of them in tests.
@@ -195,7 +197,7 @@ pub fn discovery(prefix: &str, discovery_prefix: &str, node: &str, system: &str,
                 p[k] = json!(v);
             }
         }
-        out.push(Message { topic: format!("{discovery_prefix}/sensor/{id}/{}/config", s.key), payload: p.to_string(), retain: true });
+        out.push(Message { topic: format!("{discovery_prefix}/sensor/{id}/{}/config", s.key), payload: p.to_string(), retain: true, event: false });
     }
     let p = json!({
         "name": "Control channel locked",
@@ -206,7 +208,7 @@ pub fn discovery(prefix: &str, discovery_prefix: &str, node: &str, system: &str,
         "availability_topic": avail,
         "device": device,
     });
-    out.push(Message { topic: format!("{discovery_prefix}/binary_sensor/{id}/locked/config"), payload: p.to_string(), retain: true });
+    out.push(Message { topic: format!("{discovery_prefix}/binary_sensor/{id}/locked/config"), payload: p.to_string(), retain: true, event: false });
     out
 }
 

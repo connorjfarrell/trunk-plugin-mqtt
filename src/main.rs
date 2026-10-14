@@ -230,7 +230,7 @@ impl Plugin for Mqtt {
     }
 
     fn shutdown(&mut self, grace: Duration) {
-        let last = Message { topic: messages::status_topic(&self.prefix), payload: "offline".into(), retain: true };
+        let last = Message { topic: messages::status_topic(&self.prefix), payload: "offline".into(), retain: true, event: false };
         self.link.close(last, grace.min(Duration::from_secs(3)));
     }
 }

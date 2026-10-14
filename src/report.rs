@@ -62,12 +62,13 @@ impl Reporter {
     /// retaining turned off): say they're gone, or the broker keeps them for ever.
     pub fn clean_up(&mut self, previous: &[String]) {
         let now = self.retained_topics();
-        self.cleanup = previous.iter().filter(|t| !now.contains(t)).map(|t| Message { topic: t.clone(), payload: String::new(), retain: true }).collect();
+        self.cleanup =
+            previous.iter().filter(|t| !now.contains(t)).map(|t| Message { topic: t.clone(), payload: String::new(), retain: true, event: false }).collect();
     }
 
     /// Sent at every (re)connect: that the recorder is online, Home Assistant's discovery, and what to clear from it.
     pub fn on_connect(&self) -> Vec<Message> {
-        let mut m = vec![Message { topic: messages::status_topic(&self.opt.prefix), payload: "online".into(), retain: true }];
+        let mut m = vec![Message { topic: messages::status_topic(&self.opt.prefix), payload: "online".into(), retain: true, event: false }];
         m.extend(self.discovery());
         m.extend(self.cleanup.iter().cloned());
         m
@@ -88,7 +89,7 @@ impl Reporter {
             let Some(label) = self.label(&s.short_name) else { continue };
             let n = self.counts.entry(s.short_name.clone()).or_default();
             let payload = messages::state(st.time, s, n).to_string();
-            self.out.publish(Message { topic: messages::state_topic(&self.opt.prefix, &label), payload, retain: self.opt.retain });
+            self.out.publish(Message { topic: messages::state_topic(&self.opt.prefix, &label), payload, retain: self.opt.retain, event: false });
         }
     }
 
@@ -103,7 +104,7 @@ impl Reporter {
         self.counts.entry(c.call.short_name.clone()).or_default().concluded(c);
         if self.opt.publish_calls {
             let payload = messages::call(&label, c).to_string();
-            self.out.publish(Message { topic: messages::call_topic(&self.opt.prefix, &label), payload, retain: false });
+            self.out.publish(Message { topic: messages::call_topic(&self.opt.prefix, &label), payload, retain: false, event: true });
         }
     }
 }
@@ -195,7 +196,7 @@ mod tests {
     fn on_connect_says_online_and_adds_discovery_only_when_asked() {
         let (r, _) = reporter(true, false);
         let m = r.on_connect();
-        assert_eq!(m, vec![Message { topic: "tr/status".into(), payload: "online".into(), retain: true }]);
+        assert_eq!(m, vec![Message { topic: "tr/status".into(), payload: "online".into(), retain: true, event: false }]);
         let (r, _) = reporter(true, true);
         let m = r.on_connect();
         assert!(m.len() > 1 && m.iter().skip(1).all(|m| m.topic.starts_with("homeassistant/") && m.topic.contains("rec_County")), "{m:?}");
@@ -217,7 +218,7 @@ mod tests {
         r.clean_up(&before);
         let m = r.on_connect();
         assert_eq!(m.len(), 1 + r.discovery().len() + 2);
-        assert!(m.iter().any(|m| m == &Message { topic: "tr/Old/state".into(), payload: String::new(), retain: true }));
+        assert!(m.iter().any(|m| m == &Message { topic: "tr/Old/state".into(), payload: String::new(), retain: true, event: false }));
         // Discovery turned off: its topics are cleared; state stays.
         let (mut off, _) = reporter(true, false);
         off.clean_up(&now);

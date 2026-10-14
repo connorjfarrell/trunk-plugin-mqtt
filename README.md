@@ -4,7 +4,7 @@ Publishes each system's state and every recorded call to an MQTT broker, so they
 **Home Assistant** (with auto-discovery) and to **Grafana** (through Telegraf's `mqtt_consumer`
 into InfluxDB), or to anything else that reads MQTT.
 
-It only watches: it keeps no files, never holds up the recorder, and reports every concluded call
+It only watches: it keeps no call files (only a small list of the retained topics it published, in its data folder), never holds up the recorder, and reports every concluded call
 as skipped, so nothing waits on it. If the broker goes away the plugin reconnects by itself, and
 the recorder records as usual.
 

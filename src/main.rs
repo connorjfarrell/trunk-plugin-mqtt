@@ -2,7 +2,7 @@
 //! every recorded call to an MQTT broker: for Home Assistant (with its
 //! discovery), and for Telegraf and Grafana (Telegraf's `mqtt_consumer`).
 //!
-//! It only watches: it keeps no files, so every concluded call is reported as
+//! It only watches: it keeps no call files, so every concluded call is reported as
 //! skipped and nothing waits on it.
 
 mod link;

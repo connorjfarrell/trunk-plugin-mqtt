@@ -1,4 +1,4 @@
 {
-  "config": { "file": "calls.jsonl", "includeEncrypted": false },
+  "config": { "host": "localhost", "port": 1883, "topicPrefix": "trunk-pro", "clientId": "trunk-pro", "homeAssistant": true },
   "systems": { "sys1": { "label": "County" } }
 }

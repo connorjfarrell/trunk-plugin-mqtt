@@ -197,10 +197,10 @@ impl Plugin for Mqtt {
         };
         // The link and the reporter are made together: the link replays what the reporter says at every connect.
         let mut first = Reporter::new(opt.clone(), systems.clone(), Box::new(NoPublish));
-        // Home Assistant keeps what was published until it's emptied: clear what an earlier run published that this one doesn't.
-        let seen = setup.data_dir.join(DISCOVERY_FILE);
+        // The broker keeps what was published retained until it's emptied: clear what an earlier run published that this one doesn't.
+        let seen = setup.data_dir.join(RETAINED_FILE);
         first.clean_up(&read_topics(&seen));
-        let now: Vec<String> = first.discovery().into_iter().map(|m| m.topic).collect();
+        let now = first.retained_topics();
         let (note, write_host) = (seen.clone(), host.clone());
         let on_connect = first.on_connect();
         // The set is remembered once the broker has been told it (if it never is, the next run clears what this one would have).
@@ -214,7 +214,7 @@ impl Plugin for Mqtt {
         self.reporter.status(&status);
         let d = self.link.dropped();
         if d > self.reported_drops {
-            self.host.warn(format!("the broker has been away too long: {} message(s) dropped so far", d));
+            self.host.warn(format!("{d} message(s) dropped so far: the broker has been away too long, or can't keep up"));
             self.reported_drops = d;
         }
     }
@@ -235,8 +235,8 @@ impl Plugin for Mqtt {
     }
 }
 
-/// The discovery topics the last run published, kept in the plugin's data folder.
-const DISCOVERY_FILE: &str = "discovery-topics.json";
+/// The retained topics the last run published, kept in the plugin's data folder.
+const RETAINED_FILE: &str = "retained-topics.json";
 
 fn read_topics(path: &std::path::Path) -> Vec<String> {
     std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
@@ -281,9 +281,9 @@ mod tests {
     }
 
     #[test]
-    fn discovery_topics_are_remembered_between_runs() {
+    fn retained_topics_are_remembered_between_runs() {
         let dir = trunk_recorder_plugin::testing::temp_dir("mqtt-topics");
-        let f = dir.join(DISCOVERY_FILE);
+        let f = dir.join(RETAINED_FILE);
         assert!(read_topics(&f).is_empty(), "none yet");
         let host = trunk_recorder_plugin::testing::capture().0;
         write_topics(&f, &["a/b/config".to_string()], &host);

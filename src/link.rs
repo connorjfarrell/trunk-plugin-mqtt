@@ -87,7 +87,9 @@ impl Link {
         let (me, where_) = (link.clone(), format!("{}:{}", s.host, s.port));
         let _ = std::thread::Builder::new().name("mqtt".into()).spawn(move || {
             let mut up = false;
+            // Told once the first connect's messages have gone (QoS 0) or been acknowledged (QoS 1): the count to reach, and what to do.
             let mut connected = Some(connected);
+            let mut target: Option<u64> = None;
             // What a connect has to say, until the client's queue has taken all of it.
             let mut replay: Vec<Message> = Vec::new();
             for ev in conn.iter() {
@@ -123,9 +125,18 @@ impl Link {
                     replay.retain(|m| !me.try_publish(m));
                     if replay.is_empty() {
                         me.flush_held();
+                        if connected.is_some() {
+                            target.get_or_insert_with(|| me.queued.load(Ordering::SeqCst));
+                        }
+                    }
+                }
+                if let Some(t) = target {
+                    let got = if me.qos == QoS::AtMostOnce { &me.sent } else { &me.acked };
+                    if got.load(Ordering::SeqCst) >= t {
                         if let Some(f) = connected.take() {
                             f();
                         }
+                        target = None;
                     }
                 }
             }

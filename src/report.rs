@@ -48,9 +48,21 @@ impl Reporter {
         self.systems.iter().filter(|s| !s.skip).flat_map(|s| messages::discovery(&self.opt.prefix, d, &self.opt.node, &s.label, &s.label)).collect()
     }
 
-    /// Discovery topics an earlier run published that this one doesn't: say they're gone.
+    /// Every topic this run publishes retained: availability, Home Assistant's discovery, and each system's state (when retained).
+    pub fn retained_topics(&self) -> Vec<String> {
+        let mut t = vec![messages::status_topic(&self.opt.prefix)];
+        t.extend(self.discovery().into_iter().map(|m| m.topic));
+        if self.opt.retain {
+            t.extend(self.systems.iter().filter(|s| !s.skip).map(|s| messages::state_topic(&self.opt.prefix, &s.label)));
+        }
+        t
+    }
+
+    /// Retained topics an earlier run published that this one doesn't (a renamed or left-out system, discovery or
+    /// retaining turned off): say they're gone, or the broker keeps them for ever.
     pub fn clean_up(&mut self, previous: &[String]) {
-        self.cleanup = stale_discovery(previous, &self.discovery());
+        let now = self.retained_topics();
+        self.cleanup = previous.iter().filter(|t| !now.contains(t)).map(|t| Message { topic: t.clone(), payload: String::new(), retain: true }).collect();
     }
 
     /// Sent at every (re)connect: that the recorder is online, Home Assistant's discovery, and what to clear from it.
@@ -94,11 +106,6 @@ impl Reporter {
             self.out.publish(Message { topic: messages::call_topic(&self.opt.prefix, &label), payload, retain: false });
         }
     }
-}
-
-/// Messages that empty (retained) the topics in `previous` that `current` no longer has.
-pub fn stale_discovery(previous: &[String], current: &[Message]) -> Vec<Message> {
-    previous.iter().filter(|t| !current.iter().any(|m| &m.topic == *t)).map(|t| Message { topic: t.clone(), payload: String::new(), retain: true }).collect()
 }
 
 #[cfg(test)]
@@ -195,25 +202,36 @@ mod tests {
     }
 
     #[test]
-    fn discovery_no_longer_wanted_is_emptied() {
+    fn retained_topics_no_longer_wanted_are_emptied() {
         let (mut r, _) = reporter(true, true);
-        let now: Vec<String> = r.discovery().into_iter().map(|m| m.topic).collect();
-        assert!(!now.is_empty());
+        let now = r.retained_topics();
+        assert!(now.contains(&"tr/status".to_string()) && now.contains(&"tr/County/state".to_string()), "{now:?}");
+        assert!(!now.iter().any(|t| t.contains("city")), "a system left out has none");
         // Nothing changed: nothing to clear.
         r.clean_up(&now);
-        assert_eq!(r.on_connect().len(), 1 + now.len());
-        // A topic an earlier run had, and one this run has.
+        assert_eq!(r.on_connect().len(), 1 + r.discovery().len());
+        // Topics an earlier run had (a renamed system's state and discovery), and ones this run has.
         let mut before = now.clone();
+        before.push("tr/Old/state".into());
         before.push("homeassistant/sensor/rec_Old/decode_rate/config".into());
         r.clean_up(&before);
         let m = r.on_connect();
-        assert_eq!(m.len(), 2 + now.len());
-        assert_eq!(m.last().unwrap(), &Message { topic: "homeassistant/sensor/rec_Old/decode_rate/config".into(), payload: String::new(), retain: true });
-        // Discovery turned off: all of it is cleared.
+        assert_eq!(m.len(), 1 + r.discovery().len() + 2);
+        assert!(m.iter().any(|m| m == &Message { topic: "tr/Old/state".into(), payload: String::new(), retain: true }));
+        // Discovery turned off: its topics are cleared; state stays.
         let (mut off, _) = reporter(true, false);
         off.clean_up(&now);
-        let m = off.on_connect();
-        assert_eq!(m.len(), 1 + now.len());
-        assert!(m.iter().skip(1).all(|m| m.payload.is_empty() && m.retain));
+        let cleared: Vec<_> = off.on_connect().into_iter().filter(|m| m.payload.is_empty()).map(|m| m.topic).collect();
+        assert!(!cleared.is_empty() && cleared.iter().all(|t| t.starts_with("homeassistant/")), "{cleared:?}");
+        // Retaining turned off: the retained state is cleared.
+        let out = Recorded::default();
+        let mut quiet = Reporter::new(
+            Options { prefix: "tr".into(), retain: false, publish_calls: true, discovery: None, node: "rec".into() },
+            vec![SystemLabel { short_name: "county".into(), label: "County".into(), skip: false }],
+            Box::new(out),
+        );
+        quiet.clean_up(&["tr/County/state".to_string(), "tr/status".to_string()]);
+        let cleared: Vec<_> = quiet.on_connect().into_iter().filter(|m| m.payload.is_empty()).map(|m| m.topic).collect();
+        assert_eq!(cleared, ["tr/County/state"]);
     }
 }

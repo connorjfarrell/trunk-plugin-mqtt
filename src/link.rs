@@ -60,7 +60,7 @@ pub struct Link {
 impl Link {
     /// Connect (and keep connecting). `on_connect` is sent at every connect, before anything else;
     /// `connected` is called once, after the first connect has sent them.
-    pub fn start(s: Settings, on_connect: Vec<Message>, host: Host, connected: impl FnOnce() + Send + 'static) -> Link {
+    pub fn start(s: Settings, on_connect: Vec<Message>, host: Host, connected: impl FnOnce() + Send + 'static) -> Result<Link, String> {
         let mut o = MqttOptions::new(&s.client_id, &s.host, s.port);
         o.set_keep_alive(Duration::from_secs(30));
         if !s.username.is_empty() {
@@ -85,64 +85,67 @@ impl Link {
             closing: Arc::default(),
         };
         let (me, where_) = (link.clone(), format!("{}:{}", s.host, s.port));
-        let _ = std::thread::Builder::new().name("mqtt".into()).spawn(move || {
-            let mut up = false;
-            // Told once the first connect's messages have gone (QoS 0) or been acknowledged (QoS 1): the count to reach, and what to do.
-            let mut connected = Some(connected);
-            let mut target: Option<u64> = None;
-            // What a connect has to say, until the client's queue has taken all of it.
-            let mut replay: Vec<Message> = Vec::new();
-            for ev in conn.iter() {
-                match ev {
-                    Ok(Event::Incoming(Packet::ConnAck(_))) => {
-                        up = true;
-                        host.info(format!("connected to {where_}"));
-                        host.status(State::Ok, format!("connected to {where_}"));
-                        if !me.closing.load(Ordering::SeqCst) {
-                            replay = on_connect.clone();
+        std::thread::Builder::new()
+            .name("mqtt".into())
+            .spawn(move || {
+                let mut up = false;
+                // Told once the first connect's messages have gone (QoS 0) or been acknowledged (QoS 1): the count to reach, and what to do.
+                let mut connected = Some(connected);
+                let mut target: Option<u64> = None;
+                // What a connect has to say, until the client's queue has taken all of it.
+                let mut replay: Vec<Message> = Vec::new();
+                for ev in conn.iter() {
+                    match ev {
+                        Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                            up = true;
+                            host.info(format!("connected to {where_}"));
+                            host.status(State::Ok, format!("connected to {where_}"));
+                            if !me.closing.load(Ordering::SeqCst) {
+                                replay = on_connect.clone();
+                            }
+                        }
+                        Ok(Event::Outgoing(rumqttc::Outgoing::Disconnect)) => break,
+                        Ok(Event::Outgoing(rumqttc::Outgoing::Publish(_))) => {
+                            me.sent.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok(Event::Incoming(Packet::PubAck(_))) => {
+                            me.acked.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            if up {
+                                host.warn(format!("lost the broker at {where_}: {e}"));
+                            }
+                            up = false;
+                            me.held.lock().unwrap().up = false;
+                            host.status(State::Warning, format!("can't reach {where_}: {e}"));
+                            // The next poll reconnects; don't spin while the broker is away.
+                            std::thread::sleep(Duration::from_secs(5));
                         }
                     }
-                    Ok(Event::Outgoing(rumqttc::Outgoing::Disconnect)) => break,
-                    Ok(Event::Outgoing(rumqttc::Outgoing::Publish(_))) => {
-                        me.sent.fetch_add(1, Ordering::SeqCst);
-                    }
-                    Ok(Event::Incoming(Packet::PubAck(_))) => {
-                        me.acked.fetch_add(1, Ordering::SeqCst);
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        if up {
-                            host.warn(format!("lost the broker at {where_}: {e}"));
+                    if up && !me.closing.load(Ordering::SeqCst) {
+                        replay.retain(|m| !me.try_publish(m));
+                        if replay.is_empty() {
+                            me.flush_held();
+                            if connected.is_some() {
+                                target.get_or_insert_with(|| me.queued.load(Ordering::SeqCst));
+                            }
                         }
-                        up = false;
-                        me.held.lock().unwrap().up = false;
-                        host.status(State::Warning, format!("can't reach {where_}: {e}"));
-                        // The next poll reconnects; don't spin while the broker is away.
-                        std::thread::sleep(Duration::from_secs(5));
+                    }
+                    if let Some(t) = target {
+                        let got = if me.qos == QoS::AtMostOnce { &me.sent } else { &me.acked };
+                        if got.load(Ordering::SeqCst) >= t {
+                            if let Some(f) = connected.take() {
+                                f();
+                            }
+                            target = None;
+                        }
                     }
                 }
-                if up && !me.closing.load(Ordering::SeqCst) {
-                    replay.retain(|m| !me.try_publish(m));
-                    if replay.is_empty() {
-                        me.flush_held();
-                        if connected.is_some() {
-                            target.get_or_insert_with(|| me.queued.load(Ordering::SeqCst));
-                        }
-                    }
-                }
-                if let Some(t) = target {
-                    let got = if me.qos == QoS::AtMostOnce { &me.sent } else { &me.acked };
-                    if got.load(Ordering::SeqCst) >= t {
-                        if let Some(f) = connected.take() {
-                            f();
-                        }
-                        target = None;
-                    }
-                }
-            }
-            me.done.store(true, Ordering::SeqCst);
-        });
-        link
+                me.done.store(true, Ordering::SeqCst);
+            })
+            .map_err(|e| format!("can't start the broker connection: {e}"))?;
+        Ok(link)
     }
 
     /// Whether the queue took `m` (counted for [`Link::close`]).
@@ -154,17 +157,24 @@ impl Link {
         ok
     }
 
-    /// Send what waited for the broker, then let new messages go straight through.
+    /// Send what waited for the broker, then let new messages go straight through. What the client's queue
+    /// can't take yet stays held (and the link not up), to be tried again as the queue drains.
     fn flush_held(&self) {
         let mut h = self.held.lock().unwrap();
         if h.up {
             return;
         }
-        let waiting: Vec<Message> = std::mem::take(&mut h.latest).into_values().chain(std::mem::take(&mut h.events)).collect();
-        for m in waiting {
+        while let Some(m) = h.latest.values().next().cloned() {
             if !self.try_publish(&m) {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
+                return;
             }
+            h.latest.remove(&m.topic);
+        }
+        while let Some(m) = h.events.front() {
+            if !self.try_publish(m) {
+                return;
+            }
+            h.events.pop_front();
         }
         h.up = true;
     }
@@ -297,6 +307,23 @@ mod tests {
         assert_eq!(h.events.len(), 10, "every call is still waiting");
         assert_eq!(h.latest.len(), 1);
         assert_eq!(l.dropped(), 0);
+    }
+
+    #[test]
+    fn what_the_queue_cannot_take_yet_stays_held() {
+        let (client, _conn) = Client::new(MqttOptions::new("t", "127.0.0.1", 1), 2);
+        let l = Link { client, ..away().0 };
+        for i in 0..5 {
+            l.publish(msg("p/a/call", &format!("{i}"), false));
+        }
+        l.flush_held();
+        {
+            let h = l.held.lock().unwrap();
+            assert!(!h.up, "not up until everything has been taken");
+            assert_eq!(h.events.len(), 3, "two went; the rest wait");
+            assert_eq!(h.events.front().unwrap().payload, "2", "in order");
+        }
+        assert_eq!(l.dropped(), 0, "nothing was lost");
     }
 
     #[test]

@@ -204,7 +204,7 @@ impl Plugin for Mqtt {
         let (note, write_host) = (seen.clone(), host.clone());
         let on_connect = first.on_connect();
         // The set is remembered once the broker has been told it (if it never is, the next run clears what this one would have).
-        let link = Link::start(settings, on_connect, host.clone(), move || write_topics(&note, &now, &write_host));
+        let link = Link::start(settings, on_connect, host.clone(), move || write_topics(&note, &now, &write_host))?;
         let prefix = c.topic_prefix.clone();
         host.info(format!("publishing under {prefix}/ to {}:{}", c.host, c.port));
         Ok(Mqtt { reporter: Reporter::new(opt, systems, Box::new(link.clone())), link, prefix, host, reported_drops: 0 })
